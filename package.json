@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Capture Poki games and save them for offline play",
   "bin": {
-    "pokisave": "./save_page.js"
+    "pokisave": "save_page.js"
   },
   "files": [
     "save_page.js",
@@ -12,7 +12,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/salamipurple/PokiSave.git"
+    "url": "git+https://github.com/salamipurple/PokiSave.git"
   },
   "engines": {
     "node": ">=22.12.0"
