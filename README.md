@@ -34,10 +34,21 @@ pokisave https://poki.com/en/g/stickman-hook --manual
 Serve a saved game locally:
 
 ```sh
+pokisave serve
+pokisave serve --game drive-mad
+```
+
+`pokisave serve` opens a local library at <http://localhost:8000/> with links to saved games
+inside `./games`. Use `-g` or `--game` to serve one saved game directly. You can also keep using
+`--serve <directory>` to serve any specific folder:
+
+```sh
 pokisave --serve games/drive-mad
 ```
 
-Then open <http://localhost:8000/>. Use `pokisave --help` for all capture and serving options.
+Then open <http://localhost:8000/>.
+
+Use `pokisave --help` or `pokisave serve --help` for all capture and serving options.
 
 ## Development
 

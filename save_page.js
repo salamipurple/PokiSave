@@ -130,6 +130,7 @@ const USAGE = `PokiSave - capture Poki games for offline play
 Usage: pokisave <game-name> [options]
        pokisave <page-url> [options]
        pokisave --game-url <url> [options]
+       pokisave serve [--game <game-name>] [options]
 
 Arguments:
   <game-name>              Poki game slug (e.g. drive-mad)
@@ -160,10 +161,11 @@ Offline copy:
       --keep-ads           Also save ad/analytics scripts (skipped by default)
 
 Serving:
+      serve               Browse saved games, or serve one with -g, --game <name>
+      --port <n>           Port for serve and --serve           (default: 8000)
+      --isolate            Send COOP/COEP headers when serving
       --serve <dir>        Serve a saved folder at http://localhost:<port>/ instead of capturing:
                            Range requests, correct MIME types, and every 404 is logged
-      --port <n>           Port for --serve                    (default: 8000)
-      --isolate            With --serve: send COOP/COEP headers (SharedArrayBuffer / threaded games)
 
 Output & browser:
   -o, --out <dir>          Output directory                    (default: ./games/<game-name>)
@@ -188,6 +190,8 @@ Output & browser:
 Examples:
   pokisave drive-mad -v
   pokisave stickman-hook --manual
+  pokisave serve
+  pokisave serve --game drive-mad
   pokisave --serve games/drive-mad
   pokisave -g https://example.game-cdn.com/abc/index.html --curl-only --asset data/levels.json
 `;
@@ -264,6 +268,51 @@ function gameNameFromUrl(value) {
 }
 
 function parseCli(argv) {
+  if (argv[0] === 'serve') {
+    let parsed;
+    try {
+      parsed = parseArgs({
+        args: argv.slice(1),
+        allowPositionals: true,
+        options: {
+          game: { type: 'string', short: 'g' },
+          port: { type: 'string' },
+          isolate: { type: 'boolean' },
+          verbose: { type: 'boolean', short: 'v' },
+          quiet: { type: 'boolean', short: 'q' },
+          help: { type: 'boolean', short: 'h' },
+        },
+      });
+    } catch (err) {
+      return die(err.message);
+    }
+
+    const { values, positionals } = parsed;
+    if (values.help) {
+      console.log(`Usage: pokisave serve [--game <game-name>] [options]
+
+Options:
+  -g, --game <name>  Serve one saved game instead of the game library
+      --port <n>     Port to listen on (default: 8000)
+      --isolate      Send COOP/COEP headers (SharedArrayBuffer / threaded games)
+  -v, --verbose      Log each request
+  -q, --quiet        Only print errors
+  -h, --help         Show this help
+`);
+      process.exit(0);
+    }
+    if (positionals.length) die(`unexpected extra arguments: ${positionals.join(' ')}`);
+    if (values.game && !isGameName(values.game)) die(`--game must be a game slug (got "${values.game}")`);
+
+    return {
+      serveDir: path.resolve('games', values.game || ''),
+      serveLibrary: !values.game,
+      port: toInt('port', values.port, 8000),
+      isolate: !!values.isolate,
+      logLevel: values.quiet ? LEVELS.error : values.verbose ? LEVELS.debug : LEVELS.info,
+    };
+  }
+
   let parsed;
   try {
     parsed = parseArgs({
@@ -1348,7 +1397,7 @@ function saveWithCurl(ctx) {
 function startServer(opts) {
   const http = require('http');
   const root = opts.serveDir;
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+  if ((!opts.serveLibrary && !fs.existsSync(root)) || (fs.existsSync(root) && !fs.statSync(root).isDirectory())) {
     return Promise.reject(new Error(`Not a directory: ${root}`));
   }
 
@@ -1363,6 +1412,18 @@ function startServer(opts) {
       pathname = decodeURIComponent(req.url.split('?')[0].split('#')[0]);
     } catch (_) {
       return reply(400, { 'Content-Type': 'text/plain' }, 'Bad request');
+    }
+
+    if (opts.serveLibrary && (pathname === '/' || pathname === '/index.html')) {
+      const body = renderGameLibrary(root);
+      const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
+      if (opts.isolate) {
+        headers['Cross-Origin-Opener-Policy'] = 'same-origin';
+        headers['Cross-Origin-Embedder-Policy'] = 'credentialless';
+      }
+      headers['Content-Length'] = Buffer.byteLength(body);
+      res.writeHead(200, headers);
+      return req.method === 'HEAD' ? res.end() : res.end(body);
     }
 
     const rel = pathname.replace(/^\/+/, '');
@@ -1431,6 +1492,48 @@ function startServer(opts) {
       resolve(server);
     });
   });
+}
+
+function renderGameLibrary(root) {
+  const games = fs.existsSync(root)
+    ? fs.readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && isGameName(entry.name))
+        .filter((entry) => fs.existsSync(path.join(root, entry.name, 'index.html')))
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b))
+    : [];
+  const cards = games
+    .map((game) => `<a class="game" href="/${encodeURIComponent(game)}/"><span>${game}</span><span aria-hidden="true">Play &rarr;</span></a>`)
+    .join('\n');
+  const content = games.length
+    ? `<nav class="games" aria-label="Saved games">${cards}</nav>`
+    : '<p class="empty">No saved games yet. Capture a game with <code>pokisave &lt;game-name&gt;</code> and it will appear here.</p>';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PokiSave - Your games</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10131b; color: #f5f6fa; }
+    body { box-sizing: border-box; max-width: 900px; margin: 0 auto; padding: 48px 24px; }
+    h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.5rem); }
+    .subtitle { color: #a7adbd; margin: 8px 0 32px; }
+    .games { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .game { display: flex; justify-content: space-between; gap: 16px; padding: 20px; border: 1px solid #303747; border-radius: 12px; color: inherit; text-decoration: none; background: #191e29; }
+    .game:hover, .game:focus-visible { border-color: #9c7cff; background: #22283a; }
+    .game span:last-child { color: #b6a1ff; }
+    .empty { color: #a7adbd; padding: 20px; border: 1px dashed #454d5e; border-radius: 12px; }
+    code { color: #d3c7ff; }
+  </style>
+</head>
+<body>
+  <h1>PokiSave</h1>
+  <p class="subtitle">Your saved games, ready to play offline.</p>
+  ${content}
+</body>
+</html>`;
 }
 
 // ---------------------------------------------------------------------------
