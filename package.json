@@ -14,6 +14,9 @@
     "type": "git",
     "url": "git+https://github.com/salamipurple/PokiSave.git"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=22.12.0"
   },

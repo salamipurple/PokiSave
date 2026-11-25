@@ -605,6 +605,11 @@ function stripPokiSdk(html, { shim = true } = {}) {
     if (meta && meta.index >= at && (firstScript === -1 || meta.index < firstScript)) at = meta.index + meta[0].length;
   }
   html = html.slice(0, at) + injection + html.slice(at);
+  if (/\bpoki_sdk_loaded\b/.test(html) && !html.includes('data-pokisave-sdk-load-callback')) {
+    const callback = '<script data-pokisave-sdk-load-callback>window.addEventListener("load", function () { if (typeof window.poki_sdk_loaded === "function") window.poki_sdk_loaded(); }, { once: true });</script>\n';
+    const bodyEnd = /<\/body\s*>/i;
+    html = bodyEnd.test(html) ? html.replace(bodyEnd, `${callback}$&`) : `${html}\n${callback}`;
+  }
   log.debug(`Poki SDK: removed ${removed} tag(s), injected ${shim ? 'shim + ' : ''}stub at offset ${at}`);
   return html;
 }
