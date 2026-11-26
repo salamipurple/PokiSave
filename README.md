@@ -46,7 +46,21 @@ inside `./games`. Use `-g` or `--game` to serve one saved game directly. You can
 pokisave --serve games/drive-mad
 ```
 
-Then open <http://localhost:8000/>.
+The library page can install a new game by Poki slug or game-page URL. New installs and updates
+save a local screenshot for the game card; older saves without one show a generated placeholder.
+
+Update saved games from Poki:
+
+```sh
+pokisave update
+pokisave update --game drive-mad
+```
+
+The game library page also has buttons to update an individual game or all saved games.
+
+Then open <http://localhost:8000/> and leave the server running while you play. Do not open the
+saved `index.html` directly (`file://`): games that load WebAssembly, workers, or other local
+resources need to be served over HTTP.
 
 Use `pokisave --help` or `pokisave serve --help` for all capture and serving options.
 

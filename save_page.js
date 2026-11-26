@@ -27,7 +27,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const { parseArgs } = require('util');
 
 // ---------------------------------------------------------------------------
@@ -131,6 +131,7 @@ Usage: pokisave <game-name> [options]
        pokisave <page-url> [options]
        pokisave --game-url <url> [options]
        pokisave serve [--game <game-name>] [options]
+       pokisave update [--game <game-name>]
 
 Arguments:
   <game-name>              Poki game slug (e.g. drive-mad)
@@ -165,7 +166,12 @@ Serving:
       --port <n>           Port for serve and --serve           (default: 8000)
       --isolate            Send COOP/COEP headers when serving
       --serve <dir>        Serve a saved folder at http://localhost:<port>/ instead of capturing:
+                           required for games using WebAssembly, workers, or local fetches;
                            Range requests, correct MIME types, and every 404 is logged
+
+Updating:
+      update              Refresh all saved games from Poki
+      update -g, --game   Refresh one saved game
 
 Output & browser:
   -o, --out <dir>          Output directory                    (default: ./games/<game-name>)
@@ -192,6 +198,8 @@ Examples:
   pokisave stickman-hook --manual
   pokisave serve
   pokisave serve --game drive-mad
+  pokisave update
+  pokisave update --game drive-mad
   pokisave --serve games/drive-mad
   pokisave -g https://example.game-cdn.com/abc/index.html --curl-only --asset data/levels.json
 `;
@@ -267,7 +275,64 @@ function gameNameFromUrl(value) {
   }
 }
 
+function gameSlugFromInstallInput(value) {
+  if (typeof value !== 'string') return undefined;
+  const input = value.trim();
+  if (isGameName(input)) return input.toLowerCase();
+
+  try {
+    const url = new URL(input);
+    if (!/^https?:$/.test(url.protocol) || !['poki.com', 'www.poki.com'].includes(url.hostname)) return undefined;
+    const match = /^\/(?:[a-z]{2}\/)?g\/([a-z0-9][a-z0-9-]*)\/?$/i.exec(url.pathname);
+    return match ? match[1].toLowerCase() : undefined;
+  } catch (_) {
+    return undefined;
+  }
+}
+
 function parseCli(argv) {
+  if (argv[0] === 'update') {
+    let parsed;
+    try {
+      parsed = parseArgs({
+        args: argv.slice(1),
+        allowPositionals: true,
+        options: {
+          game: { type: 'string', short: 'g' },
+          verbose: { type: 'boolean', short: 'v' },
+          quiet: { type: 'boolean', short: 'q' },
+          help: { type: 'boolean', short: 'h' },
+        },
+      });
+    } catch (err) {
+      return die(err.message);
+    }
+
+    const { values, positionals } = parsed;
+    if (values.help) {
+      console.log(`Usage: pokisave update [--game <game-name>]
+
+Refresh all saved games, or one game selected by its slug.
+
+Options:
+  -g, --game <name>  Update one saved game (default: update all)
+  -v, --verbose      Show detailed capture logs
+  -q, --quiet        Only print errors
+  -h, --help         Show this help
+`);
+      process.exit(0);
+    }
+    if (positionals.length) die(`unexpected extra arguments: ${positionals.join(' ')}`);
+    if (values.game && !isGameName(values.game)) die(`--game must be a game slug (got "${values.game}")`);
+
+    return {
+      updateCommand: true,
+      game: values.game,
+      gamesDir: path.resolve('games'),
+      logLevel: values.quiet ? LEVELS.error : values.verbose ? LEVELS.debug : LEVELS.info,
+    };
+  }
+
   if (argv[0] === 'serve') {
     let parsed;
     try {
@@ -1402,6 +1467,7 @@ function saveWithCurl(ctx) {
 function startServer(opts) {
   const http = require('http');
   const root = opts.serveDir;
+  let libraryJob = null;
   if ((!opts.serveLibrary && !fs.existsSync(root)) || (fs.existsSync(root) && !fs.statSync(root).isDirectory())) {
     return Promise.reject(new Error(`Not a directory: ${root}`));
   }
@@ -1417,6 +1483,116 @@ function startServer(opts) {
       pathname = decodeURIComponent(req.url.split('?')[0].split('#')[0]);
     } catch (_) {
       return reply(400, { 'Content-Type': 'text/plain' }, 'Bad request');
+    }
+
+    if (opts.serveLibrary && ['/__pokisave/update', '/__pokisave/install'].includes(pathname)) {
+      if (req.method !== 'POST') {
+        return reply(405, { Allow: 'POST', 'Content-Type': 'text/plain' }, 'Method not allowed');
+      }
+      if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) {
+        return replyJson(res, 403, { error: 'Cross-origin update requests are not allowed' });
+      }
+      if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
+        return replyJson(res, 415, { error: 'Content-Type must be application/json' });
+      }
+
+      void (async () => {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          return replyJson(res, err.statusCode || 400, { error: err.message });
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'game')) {
+          return replyJson(res, 400, { error: 'Expected a game slug or Poki game URL' });
+        }
+        const isInstall = pathname === '/__pokisave/install';
+        const game = isInstall ? gameSlugFromInstallInput(body.game) : body.game;
+        if (isInstall && !game) {
+          return replyJson(res, 400, { error: 'game must be a Poki game slug or URL' });
+        }
+        if (!isInstall && body.game !== undefined && (typeof body.game !== 'string' || !isGameName(body.game))) {
+          return replyJson(res, 400, { error: 'game must be a valid saved-game slug' });
+        }
+        if (libraryJob && libraryJob.status === 'running') {
+          return replyJson(res, 409, { error: 'Another library task is already running' });
+        }
+
+        let games = [];
+        if (isInstall) {
+          if (fs.existsSync(path.join(root, game))) {
+            return replyJson(res, 409, { error: `A game named "${game}" already exists` });
+          }
+          games = [game];
+        } else {
+          const savedGames = findSavedGames(root);
+          games = body.game ? [body.game] : savedGames;
+          if (body.game && !savedGames.includes(body.game)) {
+            return replyJson(res, 404, { error: `No saved game named "${body.game}"` });
+          }
+        }
+
+        libraryJob = {
+          id: require('crypto').randomUUID(),
+          kind: isInstall ? 'install' : 'update',
+          status: 'running',
+          message: isInstall ? `Installing ${game}…` : games.length ? 'Starting update…' : 'No saved games to update',
+          progress: null,
+          updated: 0,
+          results: [],
+        };
+        const job = libraryJob;
+        replyJson(res, 202, { jobId: job.id });
+
+        const onOutput = (text) => {
+          job.output = `${job.output || ''}${text}`.slice(-8000);
+        };
+        const task = isInstall
+          ? installSavedGame(root, game, onOutput).then((result) => [result])
+          : updateSavedGames(
+            root,
+            games,
+            (progress) => {
+              job.progress = progress;
+              job.message = `Updating ${progress.game} (${progress.current}/${progress.total})…`;
+            },
+            onOutput
+          );
+        task.then((results) => {
+          job.results = results;
+          job.updated = results.filter((result) => result.updated).length;
+          const failed = results.filter((result) => !result.updated);
+          job.status = failed.length ? 'failed' : 'complete';
+          job.message = isInstall
+            ? `Installed ${game}`
+            : failed.length
+              ? `Updated ${job.updated}/${results.length}; failed: ${failed.map((result) => result.game).join(', ')}`
+              : `Updated ${job.updated} game(s)`;
+        }).catch((err) => {
+          job.status = 'failed';
+          job.message = err.message;
+          log.error(`Library ${job.kind} failed: ${err.message}`);
+        });
+      })();
+      return;
+    }
+
+    const jobStatus = opts.serveLibrary && /^\/__pokisave\/jobs\/[0-9a-f-]{36}$/i.exec(pathname);
+    if (jobStatus) {
+      if (req.method !== 'GET') {
+        return reply(405, { Allow: 'GET', 'Content-Type': 'text/plain' }, 'Method not allowed');
+      }
+      const id = pathname.slice('/__pokisave/jobs/'.length);
+      if (!libraryJob || libraryJob.id !== id) return replyJson(res, 404, { error: 'Library task not found' });
+      return replyJson(res, 200, {
+        jobId: libraryJob.id,
+        kind: libraryJob.kind,
+        status: libraryJob.status,
+        message: libraryJob.message,
+        progress: libraryJob.progress,
+        updated: libraryJob.updated,
+        results: libraryJob.results,
+      });
     }
 
     if (opts.serveLibrary && (pathname === '/' || pathname === '/index.html')) {
@@ -1500,45 +1676,320 @@ function startServer(opts) {
 }
 
 function renderGameLibrary(root) {
-  const games = fs.existsSync(root)
-    ? fs.readdirSync(root, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && isGameName(entry.name))
-        .filter((entry) => fs.existsSync(path.join(root, entry.name, 'index.html')))
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b))
-    : [];
+  const games = findSavedGames(root);
   const cards = games
-    .map((game) => `<a class="game" href="/${encodeURIComponent(game)}/"><span>${game}</span><span aria-hidden="true">Play &rarr;</span></a>`)
+    .map((game) => {
+      const title = game.split('-').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+      const screenshot = path.join(root, game, '_screenshot.png');
+      const thumbnail = fs.existsSync(screenshot) && fs.statSync(screenshot).isFile()
+        ? `/${encodeURIComponent(game)}/_screenshot.png`
+        : `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" fill="#111"/><text x="50%" y="54%" fill="#fff" font-family="monospace" font-size="96" font-weight="700" text-anchor="middle">${title.split(' ').map((part) => part[0]).join('').slice(0, 3)}</text></svg>`)}`;
+      return `<article class="game"><a class="game-link" href="/${encodeURIComponent(game)}/"><img class="thumbnail" src="${thumbnail}" alt="${title} thumbnail"><span class="game-title">${title}</span></a><button type="button" class="update-game" data-game="${game}" aria-label="Update ${title}">Update</button></article>`;
+    })
     .join('\n');
   const content = games.length
     ? `<nav class="games" aria-label="Saved games">${cards}</nav>`
-    : '<p class="empty">No saved games yet. Capture a game with <code>pokisave &lt;game-name&gt;</code> and it will appear here.</p>';
+    : '<p class="empty">Your library is empty. Install a game using its Poki slug or game-page URL above.</p>';
 
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PokiSave - Your games</title>
+  <title>PokiSave — Game archive</title>
   <style>
-    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10131b; color: #f5f6fa; }
-    body { box-sizing: border-box; max-width: 900px; margin: 0 auto; padding: 48px 24px; }
-    h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.5rem); }
-    .subtitle { color: #a7adbd; margin: 8px 0 32px; }
-    .games { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
-    .game { display: flex; justify-content: space-between; gap: 16px; padding: 20px; border: 1px solid #303747; border-radius: 12px; color: inherit; text-decoration: none; background: #191e29; }
-    .game:hover, .game:focus-visible { border-color: #9c7cff; background: #22283a; }
-    .game span:last-child { color: #b6a1ff; }
-    .empty { color: #a7adbd; padding: 20px; border: 1px dashed #454d5e; border-radius: 12px; }
-    code { color: #d3c7ff; }
+    :root { color-scheme: light; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #151515; color: #101010; }
+    * { box-sizing: border-box; }
+    body { max-width: 1600px; margin: 0 auto; padding: 28px; }
+    .shell { min-height: calc(100vh - 56px); overflow: hidden; border: 1px solid #444; border-radius: 28px; background: #fff; }
+    .hero { display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, .82fr); min-height: 360px; border-bottom: 1px solid #111; }
+    .hero-copy { display: flex; flex-direction: column; justify-content: center; padding: clamp(32px, 6vw, 82px); }
+    .eyebrow { margin: 0 0 24px; color: #555; font-size: .82rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(4rem, 10vw, 9.5rem); line-height: .78; letter-spacing: -.12em; }
+    .subtitle { margin: 34px 0 0; color: #555; font-size: clamp(.85rem, 2vw, 1.15rem); letter-spacing: .02em; }
+    .dot-panel { min-height: 300px; background-color: #050505; background-image: radial-gradient(circle, #fff 6px, transparent 7px); background-size: 52px 52px; background-position: 0 0; }
+    .content { padding: clamp(22px, 4vw, 54px); }
+    .install-panel { display: grid; grid-template-columns: minmax(160px, .7fr) minmax(260px, 1.3fr); gap: 24px; align-items: center; margin-bottom: 42px; padding: 24px; border: 1px solid #111; background: #f1f1f1; }
+    h2 { margin: 0; font-size: 1.1rem; letter-spacing: .06em; text-transform: uppercase; }
+    .install-hint { display: block; margin-top: 8px; color: #555; font-size: .78rem; line-height: 1.5; }
+    .install-controls { display: flex; gap: 10px; }
+    input, button { min-height: 46px; border: 1px solid #111; border-radius: 0; font: inherit; }
+    input { min-width: 0; flex: 1; padding: 0 14px; background: #fff; color: #111; }
+    input:focus-visible, button:focus-visible, a:focus-visible { outline: 3px solid #888; outline-offset: 3px; }
+    button { padding: 0 18px; background: #050505; color: #fff; cursor: pointer; font-weight: 700; }
+    button:hover, button:focus-visible { background: #333; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .library-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    .library-heading h2 { font-size: 1.35rem; }
+    #update-all { background: #fff; color: #111; }
+    #update-all:hover, #update-all:focus-visible { background: #e8e8e8; }
+    #update-status { min-height: 1.3em; margin: 12px 0 20px; color: #555; font-size: .85rem; overflow-wrap: anywhere; }
+    .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 18px; }
+    .game { min-width: 0; border: 1px solid #111; background: #fff; }
+    .game-link { display: block; color: inherit; text-decoration: none; }
+    .thumbnail { display: block; width: 100%; aspect-ratio: 16 / 9; border-bottom: 1px solid #111; background: #111; object-fit: cover; }
+    .game-title { display: block; overflow: hidden; padding: 14px 14px 8px; font-size: .95rem; font-weight: 800; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+    .update-game { width: calc(100% - 28px); min-height: 38px; margin: 0 14px 14px; background: #f1f1f1; color: #111; font-size: .78rem; }
+    .update-game:hover, .update-game:focus-visible { background: #ddd; }
+    .empty { margin: 0; padding: 24px; border: 1px dashed #111; color: #555; line-height: 1.6; }
+    @media (max-width: 700px) {
+      body { padding: 10px; }
+      .shell { min-height: calc(100vh - 20px); border-radius: 18px; }
+      .hero { grid-template-columns: 1fr; }
+      .hero-copy { min-height: 260px; padding: 38px 26px; }
+      .dot-panel { min-height: 150px; background-size: 42px 42px; }
+      .install-panel { grid-template-columns: 1fr; padding: 18px; }
+      .install-controls { flex-direction: column; }
+      .library-heading { align-items: flex-start; flex-direction: column; }
+    }
   </style>
 </head>
 <body>
-  <h1>PokiSave</h1>
-  <p class="subtitle">Your saved games, ready to play offline.</p>
-  ${content}
+  <main class="shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Monochrome / Local game archive</p>
+        <h1>Poki<br>Save</h1>
+        <p class="subtitle">BLACK INK. WHITE PAPER. GAMES SAVED OFFLINE.</p>
+      </div>
+      <div class="dot-panel" aria-hidden="true"></div>
+    </header>
+    <section class="content" aria-label="Game library">
+      <form class="install-panel" id="install-form">
+        <div>
+          <h2>Install a game</h2>
+          <span class="install-hint">Enter a Poki game slug or its Poki game-page URL.</span>
+        </div>
+        <div class="install-controls">
+          <input id="install-game" name="game" type="text" placeholder="drive-mad or https://poki.com/en/g/…" autocomplete="url" required>
+          <button type="submit" id="install-button">Install</button>
+        </div>
+      </form>
+      <div class="library-heading">
+        <h2>Your library</h2>
+        <button type="button" id="update-all"${games.length ? '' : ' disabled'}>Update all</button>
+      </div>
+      <div id="update-status" role="status" aria-live="polite"></div>
+      ${content}
+    </section>
+  </main>
+  <script>
+    const status = document.getElementById('update-status');
+    const installForm = document.getElementById('install-form');
+    const installInput = document.getElementById('install-game');
+    const buttons = [...document.querySelectorAll('button')];
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    async function runLibraryTask(kind, body) {
+      buttons.forEach((button) => { button.disabled = true; });
+      installInput.disabled = true;
+      status.textContent = kind === 'install' ? 'Starting install…' : body.game ? 'Starting update for ' + body.game + '…' : 'Starting update of all games…';
+      try {
+        const response = await fetch('/__pokisave/' + kind, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const started = await response.json();
+        if (!response.ok) throw new Error(started.error || 'Could not start library task');
+
+        while (true) {
+          await sleep(1000);
+          const poll = await fetch('/__pokisave/jobs/' + encodeURIComponent(started.jobId), { cache: 'no-store' });
+          const job = await poll.json();
+          if (!poll.ok) throw new Error(job.error || 'Could not get task status');
+          const errors = (job.results || [])
+            .filter((result) => !result.updated)
+            .map((result) => result.game + ': ' + String(result.error || 'Unknown error').slice(0, 600));
+          status.textContent = [job.message, ...errors].join(' — ');
+          if (job.status !== 'running') {
+            buttons.forEach((button) => { button.disabled = false; });
+            installInput.disabled = false;
+            if (job.kind === 'install' && job.status === 'complete') {
+              setTimeout(() => window.location.reload(), 900);
+            }
+            return;
+          }
+        }
+      } catch (error) {
+        status.textContent = error.message;
+        buttons.forEach((button) => { button.disabled = false; });
+        installInput.disabled = false;
+      }
+    }
+
+    installForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      runLibraryTask('install', { game: installInput.value.trim() });
+    });
+    document.getElementById('update-all').addEventListener('click', () => runLibraryTask('update', {}));
+    document.querySelectorAll('.update-game').forEach((button) => {
+      button.addEventListener('click', () => runLibraryTask('update', { game: button.dataset.game }));
+    });
+  </script>
 </body>
 </html>`;
+}
+
+function replyJson(res, status, value) {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 4096) {
+      req.resume();
+      const error = new Error('Request body is too large');
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  } catch (_) {
+    throw new Error('Request body must be valid JSON');
+  }
+}
+
+function findSavedGames(root) {
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isGameName(entry.name))
+    .filter((entry) => {
+      const index = path.join(root, entry.name, 'index.html');
+      return fs.existsSync(index) && fs.statSync(index).isFile();
+    })
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function runCaptureChild(gameName, outDir, onOutput, logLevel = currentLevel) {
+  const pageUrl = `https://poki.com/en/g/${encodeURIComponent(gameName)}`;
+  const args = [__filename, pageUrl, '--out', outDir, '--manifest', '--screenshot'];
+  if (logLevel === LEVELS.error) args.push('--quiet');
+  else if (logLevel === LEVELS.debug) args.push('--verbose');
+  return new Promise((resolve, reject) => {
+    let output = '';
+    const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const collect = (stream) => (chunk) => {
+      const text = chunk.toString();
+      output = `${output}${text}`.slice(-8000);
+      if (onOutput) onOutput(text, stream);
+    };
+    child.stdout.on('data', collect('stdout'));
+    child.stderr.on('data', collect('stderr'));
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (code === 0) return resolve();
+      const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+      reject(new Error(`Capture for ${gameName} failed (${reason})${output.trim() ? `:\n${output.trim()}` : ''}`));
+    });
+  });
+}
+
+async function installSavedGame(gamesDir, gameName, onOutput, logLevel = currentLevel) {
+  if (!isGameName(gameName)) throw new Error(`Invalid game slug: ${gameName}`);
+  const target = path.join(gamesDir, gameName);
+  if (fs.existsSync(target)) throw new Error(`A game named "${gameName}" already exists`);
+
+  fs.mkdirSync(gamesDir, { recursive: true });
+  const staging = fs.mkdtempSync(path.join(gamesDir, `.pokisave-install-${gameName}-`));
+  try {
+    await runCaptureChild(gameName, staging, onOutput, logLevel);
+    const stagedIndex = path.join(staging, 'index.html');
+    if (!fs.existsSync(stagedIndex) || !fs.statSync(stagedIndex).isFile()) {
+      throw new Error(`Capture for "${gameName}" did not produce an index.html`);
+    }
+    if (fs.existsSync(target)) throw new Error(`A game named "${gameName}" was installed while capture was running`);
+    fs.renameSync(staging, target);
+    log.info(`Installed ${gameName}`);
+    return { game: gameName, updated: true };
+  } finally {
+    if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+async function updateSavedGame(gamesDir, gameName, onOutput, logLevel = currentLevel) {
+  if (!isGameName(gameName)) throw new Error(`Invalid game slug: ${gameName}`);
+  const target = path.join(gamesDir, gameName);
+  if (!fs.existsSync(target) || !fs.statSync(target).isDirectory() || !findSavedGames(gamesDir).includes(gameName)) {
+    throw new Error(`No saved game named "${gameName}" in ${gamesDir}`);
+  }
+
+  const staging = fs.mkdtempSync(path.join(gamesDir, `.pokisave-update-${gameName}-`));
+  const backup = `${staging}.previous`;
+  try {
+    await runCaptureChild(gameName, staging, onOutput, logLevel);
+    const stagedIndex = path.join(staging, 'index.html');
+    if (!fs.existsSync(stagedIndex) || !fs.statSync(stagedIndex).isFile()) {
+      throw new Error(`Updated capture for "${gameName}" did not produce an index.html`);
+    }
+
+    fs.renameSync(target, backup);
+    try {
+      fs.renameSync(staging, target);
+    } catch (err) {
+      fs.renameSync(backup, target);
+      throw err;
+    }
+    try {
+      fs.rmSync(backup, { recursive: true, force: true });
+    } catch (err) {
+      log.warn(`Updated ${gameName}, but could not remove old files at ${backup}: ${err.message}`);
+    }
+    log.info(`Updated ${gameName}`);
+  } finally {
+    if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+async function updateSavedGames(gamesDir, gameNames, onProgress, onOutput) {
+  const results = [];
+  for (let index = 0; index < gameNames.length; index += 1) {
+    const game = gameNames[index];
+    if (onProgress) onProgress({ current: index + 1, total: gameNames.length, game });
+    try {
+      await updateSavedGame(gamesDir, game, onOutput);
+      results.push({ game, updated: true });
+    } catch (err) {
+      log.error(`Failed to update ${game}: ${err.message}`);
+      results.push({ game, updated: false, error: err.message });
+    }
+  }
+  return results;
+}
+
+async function runUpdateCommand(opts) {
+  const savedGames = findSavedGames(opts.gamesDir);
+  const games = opts.game ? [opts.game] : savedGames;
+  if (opts.game && !savedGames.includes(opts.game)) {
+    throw new Error(`No saved game named "${opts.game}" in ${opts.gamesDir}`);
+  }
+  if (!games.length) {
+    log.info(`No saved games found in ${opts.gamesDir}`);
+    return;
+  }
+
+  const results = await updateSavedGames(
+    opts.gamesDir,
+    games,
+    ({ current, total, game }) => log.info(`Updating ${game} (${current}/${total})`),
+    (text, stream) => process[stream].write(text)
+  );
+  const updated = results.filter((result) => result.updated).length;
+  const failed = results.filter((result) => !result.updated);
+  log.info(`Update finished: ${updated}/${games.length} game(s) updated`);
+  if (failed.length) throw new Error(`Failed to update: ${failed.map((result) => result.game).join(', ')}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1553,6 +2004,10 @@ async function main() {
   if (opts.serveDir) {
     await startServer(opts);
     return; // keep running until Ctrl+C
+  }
+  if (opts.updateCommand) {
+    await runUpdateCommand(opts);
+    return;
   }
 
   fs.mkdirSync(opts.outDir, { recursive: true });
@@ -1598,6 +2053,7 @@ async function main() {
   }
   log.info(`Done (${mode}): ${summarizeFiles(ctx.files)} saved to ${opts.outDir}`);
   log.info(`Play it offline:  pokisave --serve "${opts.outDir}"   then open http://localhost:8000/`);
+  log.warn('Keep the server running while playing; opening the saved index.html as file:// will break games that fetch local assets.');
   log.info('Stuck on a menu offline? Re-run with --manual and play a level; every 404 the server logs is a missing file.');
 }
 
@@ -1613,5 +2069,5 @@ module.exports = {
   urlToRelativePath, toHref, relHref, safeJoin, stripPokiSdk, extractUrlsFromHtml, findGameFrame, describePage,
   refererFor, failureHint, verifyLocalRefs, retryUnreadable, makeGameMatcher, finalizePage, summarizeFiles,
   writeOutputPage, saveResponse, autoPlay, diagnoseSaved, startServer, skipReasonFor,
-  parseCli, isGameName, gameNameFromUrl, OFFLINE_SHIM_JS, POKI_SDK_STUB_JS,
+  parseCli, isGameName, gameNameFromUrl, gameSlugFromInstallInput, OFFLINE_SHIM_JS, POKI_SDK_STUB_JS,
 };
